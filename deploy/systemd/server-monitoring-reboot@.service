@@ -1,0 +1,10 @@
+[Unit]
+Description=Schedule a host reboot requested by Server Monitoring Bot
+
+[Service]
+Type=oneshot
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+TimeoutStartSec=10s
+ExecStart=/bin/bash /usr/local/libexec/server-monitoring-reboot

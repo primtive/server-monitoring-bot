@@ -1,0 +1,9 @@
+#!/bin/bash
+set -eu
+
+IFS= read -r -t 3 -n 16 request
+[[ "$request" == REBOOT ]]
+
+/usr/bin/systemd-run --quiet --on-active=5s --timer-property=AccuracySec=1s \
+  --unit=server-monitoring-reboot-delayed /usr/bin/systemctl --no-block reboot
+printf '%s\n' OK

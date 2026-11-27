@@ -1,6 +1,19 @@
 services:
+  collector:
+    # Set the Docker socket group ID using: stat -c '%g' /var/run/docker.sock
+    group_add: []
   bot:
     environment:
       BOT_TOKEN: ""
       GROUP_CHAT_ID: ""
       ALLOWED_USER_IDS: ""
+      # To enable reboot, set both variables and uncomment the bind mount below.
+      # REBOOT_USER_IDS: ""
+      # REBOOT_SOCKET: "/run/host-control/reboot.sock"
+    # volumes:
+    #   - type: bind
+    #     source: /run/server-monitoring-bot
+    #     target: /run/host-control
+    #     read_only: true
+    #     bind:
+    #       create_host_path: false

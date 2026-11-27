@@ -2,8 +2,15 @@ import json
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import TypedDict
 
 SNAPSHOT_PATH = Path("/run/dabro/snapshot.json")
+
+
+class ContainerSummary(TypedDict):
+    name: str
+    image: str
+    status: str
 
 
 @dataclass(frozen=True)
@@ -15,6 +22,12 @@ class Snapshot:
     memory_total_kib: int | None
     uptime_seconds: int | None
     lan_ipv4: str | None
+    cpu_average_percent: float | None = None
+    cpu_average_seconds: int | None = None
+    disk_used_bytes: int | None = None
+    disk_total_bytes: int | None = None
+    docker_running: int | None = None
+    docker_containers: list[ContainerSummary] | None = None
 
 
 def write_snapshot(snapshot: Snapshot, path: Path = SNAPSHOT_PATH) -> None:

@@ -1,6 +1,7 @@
 import math
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlsplit
 
 
@@ -26,6 +27,18 @@ def positive_env(name: str) -> float:
     if value <= 0:
         raise ValueError(f"Значение {name} должно быть положительным.")
     return value
+
+
+def user_ids_env(name: str) -> frozenset[int]:
+    try:
+        user_ids = frozenset(
+            int(value) for value in os.environ.get(name, "").split(",") if value.strip()
+        )
+    except ValueError:
+        raise ValueError(f"В {name} укажите числовые ID через запятую.") from None
+    if any(user_id <= 0 for user_id in user_ids):
+        raise ValueError(f"{name} принимает положительные ID пользователей.")
+    return user_ids
 
 
 @dataclass(frozen=True)
@@ -54,6 +67,28 @@ class TelegramConfig:
 
 
 @dataclass(frozen=True)
+class RebootConfig:
+    user_ids: frozenset[int] = frozenset()
+    socket_path: Path | None = None
+    confirmation_seconds: float = 60
+
+    @classmethod
+    def from_env(cls, allowed_user_ids: frozenset[int]) -> "RebootConfig":
+        reboot_user_ids = user_ids_env("REBOOT_USER_IDS")
+        socket_path = os.environ.get("REBOOT_SOCKET", "").strip()
+        if not reboot_user_ids <= allowed_user_ids:
+            raise ValueError("REBOOT_USER_IDS должны входить в ALLOWED_USER_IDS.")
+        if bool(reboot_user_ids) != bool(socket_path):
+            raise ValueError("Для /reboot задайте REBOOT_USER_IDS и REBOOT_SOCKET вместе.")
+        if not socket_path:
+            return cls()
+        path = Path(socket_path)
+        if not path.is_absolute():
+            raise ValueError("REBOOT_SOCKET должен быть абсолютным путём.")
+        return cls(reboot_user_ids, path, positive_env("REBOOT_CONFIRM_SECONDS"))
+
+
+@dataclass(frozen=True)
 class MonitorConfig:
     group_chat_id: int
     allowed_user_ids: frozenset[int]
@@ -61,6 +96,7 @@ class MonitorConfig:
     alert_c: float
     rearm_c: float
     startup_wait: float
+    reboot: RebootConfig = RebootConfig()
 
     @classmethod
     def from_env(cls) -> "MonitorConfig":
@@ -71,16 +107,7 @@ class MonitorConfig:
         if group_chat_id >= 0:
             raise ValueError("GROUP_CHAT_ID должен быть отрицательным.")
 
-        try:
-            allowed_user_ids = frozenset(
-                int(value) for value in os.environ.get("ALLOWED_USER_IDS", "").split(",")
-                if value.strip()
-            )
-        except ValueError:
-            raise ValueError("В ALLOWED_USER_IDS укажите числовые ID через запятую.") from None
-        if any(user_id <= 0 for user_id in allowed_user_ids):
-            raise ValueError("ALLOWED_USER_IDS принимает положительные ID пользователей.")
-
+        allowed_user_ids = user_ids_env("ALLOWED_USER_IDS")
         alert_c = number_env("TEMPERATURE_ALERT_C")
         rearm_c = number_env("TEMPERATURE_REARM_C")
         if rearm_c >= alert_c:
@@ -89,4 +116,5 @@ class MonitorConfig:
         return cls(
             group_chat_id, allowed_user_ids, positive_env("SAMPLE_INTERVAL_SECONDS"),
             alert_c, rearm_c, positive_env("STARTUP_IP_WAIT_SECONDS"),
+            RebootConfig.from_env(allowed_user_ids),
         )

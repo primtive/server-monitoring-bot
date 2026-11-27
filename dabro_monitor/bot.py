@@ -17,24 +17,46 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramServerError,
 )
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.methods import TelegramMethod
 from aiogram.types import BotCommand, Message
 from aiohttp_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
 
 from .config import MonitorConfig, TelegramConfig
-from .snapshot import Snapshot, read_snapshot
+from .reboot import can_reboot, reboot_router
+from .render import (
+    format_cpu,
+    format_disk,
+    format_docker,
+    format_docker_ps,
+    format_ip,
+    format_memory,
+    format_status,
+    format_temperature,
+    format_uptime,
+)
+from .snapshot import read_snapshot
 
 LOGGER = logging.getLogger(__name__)
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+METRICS = {
+    "status": ("Состояние сервера", format_status),
+    "cpu": ("Текущая и средняя загрузка CPU, температура", format_cpu),
+    "temp": ("Температура CPU", format_temperature),
+    "mem": ("Занятая и общая RAM", format_memory),
+    "disk": ("Занятое и общее место на диске", format_disk),
+    "uptime": ("Аптайм сервера", format_uptime),
+    "ip": ("LAN-адрес сервера", format_ip),
+    "docker": ("Число запущенных контейнеров", format_docker),
+    "ps": ("Краткий список запущенных контейнеров", format_docker_ps),
+}
 COMMANDS = [
-    BotCommand(command="status", description="Температура, CPU, RAM и аптайм"),
-    BotCommand(command="ip", description="LAN-адрес сервера"),
+    *(BotCommand(command=name, description=description) for name, (description, _) in METRICS.items()),
     BotCommand(command="help", description="Список команд"),
     BotCommand(command="start", description="Открыть мониторинг"),
 ]
 HELP_TEXT = "Dabro · Мониторинг\n\n" + "\n".join(
-    f"/{command.command} — {command.description}" for command in COMMANDS[:3]
+    f"/{name} — {description}" for name, (description, _) in METRICS.items()
 )
 
 
@@ -57,48 +79,6 @@ class TelegramProxySession(AiohttpSession):
             raise TelegramNetworkError(method=method, message="HTTP proxy unavailable") from None
 
 
-def format_ip(snapshot: Snapshot | None) -> str:
-    address = snapshot.lan_ipv4 if snapshot else None
-    return f"LAN IPv4: {address or 'нет данных'}"
-
-
-def format_uptime(seconds: int | None) -> str:
-    if seconds is None:
-        return "нет данных"
-    days, remainder = divmod(seconds, 86400)
-    hours, remainder = divmod(remainder, 3600)
-    minutes = remainder // 60
-    parts = [f"{value} {unit}" for value, unit in (
-        (days, "д"), (hours, "ч"), (minutes, "мин"),
-    ) if value]
-    return " ".join(parts) or "меньше минуты"
-
-
-def format_status(snapshot: Snapshot | None) -> str:
-    if snapshot is None:
-        return "Dabro · Состояние\n\nНет свежих данных с сервера."
-
-    temperature = "нет данных"
-    if snapshot.temperature_c is not None:
-        temperature = f"{snapshot.temperature_c:g} °C"
-    cpu = "нет данных"
-    if snapshot.cpu_percent is not None:
-        cpu = f"{snapshot.cpu_percent:.0f}%"
-    ram = "нет данных"
-    if snapshot.memory_used_kib is not None and snapshot.memory_total_kib:
-        gib = 1024 ** 2
-        used = snapshot.memory_used_kib
-        total = snapshot.memory_total_kib
-        ram = f"{used / gib:.1f} / {total / gib:.1f} ГиБ ({used / total:.0%})"
-    return "\n".join((
-        "Dabro · Состояние", "",
-        f"Температура CPU: {temperature}",
-        f"Загрузка CPU: {cpu}",
-        f"RAM: {ram}",
-        f"Аптайм: {format_uptime(snapshot.uptime_seconds)}",
-    ))
-
-
 def is_allowed(message: Message, config: MonitorConfig) -> bool:
     if message.chat.type in GROUP_TYPES:
         return message.chat.id == config.group_chat_id
@@ -113,16 +93,17 @@ def dispatcher_for(config: MonitorConfig) -> Dispatcher:
 
     @dispatcher.message(Command("start", "help"))
     async def help_command(message: Message) -> None:
-        await message.answer(HELP_TEXT)
+        help_text = HELP_TEXT
+        if message.from_user and can_reboot(config.reboot, message.chat, message.from_user.id):
+            help_text += "\n/reboot — Перезагрузка сервера с подтверждением"
+        await message.answer(help_text)
 
-    @dispatcher.message(Command("status"))
-    async def status_command(message: Message) -> None:
-        await message.answer(format_status(read_snapshot(config.interval * 3)))
+    @dispatcher.message(Command(*METRICS, ignore_case=True))
+    async def metric_command(message: Message, command: CommandObject) -> None:
+        _, format_metric = METRICS[command.command.lower()]
+        await message.answer(format_metric(read_snapshot(config.interval * 3)))
 
-    @dispatcher.message(Command("ip"))
-    async def ip_command(message: Message) -> None:
-        await message.answer(format_ip(read_snapshot(config.interval * 3)))
-
+    dispatcher.include_router(reboot_router(config.reboot))
     return dispatcher
 
 

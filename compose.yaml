@@ -16,11 +16,21 @@ services:
     environment:
       SAMPLE_INTERVAL_SECONDS: &sample_interval "15"
       LAN_INTERFACE: ""
+      CPU_AVERAGE_SECONDS: "300"
+      DOCKER_LIST_LIMIT: "10"
     volumes:
       - /proc/stat:/host/proc/stat:ro
       - /proc/meminfo:/host/proc/meminfo:ro
       - /proc/uptime:/host/proc/uptime:ro
       - /sys:/host/sys:ro
+      # A bind-mounted file on the host filesystem to measure.
+      - /etc/hostname:/host/disk:ro
+      - type: bind
+        source: /var/run/docker.sock
+        target: /host/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false
       - snapshots:/run/dabro
 
   bot:
@@ -37,6 +47,9 @@ services:
       TEMPERATURE_ALERT_C: "50"
       TEMPERATURE_REARM_C: "47"
       STARTUP_IP_WAIT_SECONDS: "60"
+      REBOOT_USER_IDS: ""
+      REBOOT_SOCKET: ""
+      REBOOT_CONFIRM_SECONDS: "60"
     networks:
       - vpn_proxy
     volumes:

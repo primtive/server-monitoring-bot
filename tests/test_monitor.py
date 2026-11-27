@@ -1,22 +1,32 @@
 import asyncio
+import json
+import os
 import tempfile
 import time
 import unittest
+from dataclasses import replace
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from socketserver import UnixStreamServer
+from threading import Thread
 from unittest.mock import AsyncMock, patch
 
 from aiogram import Bot
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramNetworkError
-from aiogram.methods import GetMe, SendMessage
-from aiogram.types import BotFullInfo, Update
+from aiogram.methods import AnswerCallbackQuery, EditMessageText, GetMe, SendMessage
+from aiogram.types import BotFullInfo, Message, Update
 
 from dabro_monitor.bot import (
     TelegramProxySession, TemperatureAlarm, announce_startup, dispatcher_for, format_status,
     notify_group,
 )
-from dabro_monitor.collector import cpu_counters, cpu_temperature, cpu_usage, lan_ipv4, memory_usage
-from dabro_monitor.config import MonitorConfig
+from dabro_monitor.collector import (
+    CpuHistory, cpu_counters, cpu_temperature, cpu_usage, disk_usage, lan_ipv4, memory_usage,
+)
+from dabro_monitor.config import MonitorConfig, RebootConfig
+from dabro_monitor.docker_metrics import docker_ps
+from dabro_monitor.reboot import request_reboot
 from dabro_monitor.snapshot import Snapshot, read_snapshot, write_snapshot
 
 CONFIG = MonitorConfig(-10012345, frozenset({42}), 15, 50, 47, 0)
@@ -36,6 +46,58 @@ def sample(**changes):
 
 
 class CollectorTest(unittest.TestCase):
+    def test_disk_used_and_total(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stats = os.statvfs(directory)
+            used, total = disk_usage(Path(directory))
+            self.assertEqual(total, stats.f_frsize * stats.f_blocks)
+            self.assertGreaterEqual(used, 0)
+            self.assertLessEqual(used, total)
+            self.assertEqual(disk_usage(Path(directory) / "missing"), (None, None))
+
+    def test_cpu_history_uses_counter_deltas_over_the_window(self):
+        history = CpuHistory(300)
+        self.assertEqual(history.sample(0, (100, 0)), (None, None, None))
+        self.assertEqual(history.sample(100, (200, 100)), (0, 0, 100))
+        self.assertEqual(history.sample(280, (400, 100)), (100, 200 / 3, 280))
+        current, average, seconds = history.sample(400, (500, 200))
+        self.assertEqual(current, 0)
+        self.assertAlmostEqual(average, 200 / 3)
+        self.assertEqual(seconds, 300)
+        self.assertEqual(history.sample(410, None), (None, None, None))
+        self.assertEqual(history.sample(420, (510, 210)), (None, None, None))
+
+    def test_docker_api_counts_all_rows_and_limits_the_summary(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append(self.path)
+                body = json.dumps([
+                    {"Id": "abcdef", "Names": ["/bot"], "Image": "bot:latest", "Status": "Up 1 minute"},
+                    {"Id": "123456", "Names": ["/db"], "Image": "postgres", "Status": "Up 2 minutes"},
+                ]).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "api.sock"
+            with UnixStreamServer(str(path), Handler) as server:
+                thread = Thread(target=server.handle_request)
+                thread.start()
+                result = docker_ps(path, 1)
+                thread.join(timeout=4)
+            self.assertEqual(result, (2, [
+                {"name": "bot", "image": "bot:latest", "status": "Up 1 minute"},
+            ]))
+            self.assertEqual(requests, ["/containers/json?all=0"])
+        self.assertEqual(docker_ps(path, 1), (None, None))
+
     def test_uses_host_cpu_counters_and_available_memory(self):
         with tempfile.TemporaryDirectory() as directory:
             proc = Path(directory)
@@ -106,19 +168,150 @@ class RecordingSession(AiohttpSession):
     def __init__(self):
         super().__init__()
         self.messages = []
+        self.requests = []
 
     async def make_request(self, bot, method, timeout=None):
+        self.requests.append(method)
         if isinstance(method, GetMe):
             return BotFullInfo.model_construct(
                 id=bot.id, is_bot=True, first_name="Dabro", username="DabroTestBot",
             )
         if isinstance(method, SendMessage):
             self.messages.append((method.chat_id, method.text))
+            return Message.model_validate({
+                "message_id": len(self.messages),
+                "date": 0,
+                "chat": {
+                    "id": method.chat_id, "type": "private" if method.chat_id > 0 else "supergroup",
+                },
+            }, context={"bot": bot})
+        if isinstance(method, (AnswerCallbackQuery, EditMessageText)):
             return True
         raise AssertionError(type(method).__name__)
 
 
 class BotTest(unittest.IsolatedAsyncioTestCase):
+    async def feed_message(self, dispatcher, bot, chat_id, chat_type, user_id, text):
+        update = Update.model_validate({
+            "update_id": 1,
+            "message": {
+                "message_id": 100,
+                "date": 1,
+                "chat": {"id": chat_id, "type": chat_type},
+                "from": {"id": user_id, "is_bot": False, "first_name": "Test"},
+                "text": text,
+            },
+        }, context={"bot": bot})
+        await dispatcher.feed_update(bot, update)
+
+    async def feed_callback(
+        self, dispatcher, bot, data, message_id, user_id=42, chat_id=42, chat_type="private",
+    ):
+        update = Update.model_validate({
+            "update_id": 2,
+            "callback_query": {
+                "id": "1",
+                "chat_instance": "test",
+                "from": {"id": user_id, "is_bot": False, "first_name": "Test"},
+                "message": {
+                    "message_id": message_id, "date": 1, "chat": {"id": chat_id, "type": chat_type},
+                },
+                "data": data,
+            },
+        }, context={"bot": bot})
+        await dispatcher.feed_update(bot, update)
+
+    async def test_each_metric_and_status_without_docker(self):
+        dispatcher = dispatcher_for(CONFIG)
+        session = RecordingSession()
+        snapshot = sample(
+            cpu_average_percent=17, cpu_average_seconds=300,
+            disk_used_bytes=8 * 1024 ** 3, disk_total_bytes=16 * 1024 ** 3,
+            docker_running=2, docker_containers=[
+                {"name": "bot", "image": "bot:latest", "status": "Up 1 minute"},
+            ],
+        )
+        commands = {
+            "/status": "Диск: 8.0 / 16.0 ГиБ (50%)",
+            "/cpu": "Средняя за 5 мин: 17%",
+            "/temp": "50 °C",
+            "/mem": "4.0 / 16.0 ГиБ",
+            "/disk": "8.0 / 16.0 ГиБ",
+            "/uptime": "1 д 2 ч",
+            "/docker": "Контейнеров запущено: 2",
+            "/ps": "bot · bot:latest · Up 1 minute\n… и ещё 1",
+        }
+        async with session:
+            bot = Bot(TEST_TOKEN, session=session)
+            with patch("dabro_monitor.bot.read_snapshot", return_value=snapshot):
+                for command, expected in commands.items():
+                    await self.feed_message(dispatcher, bot, 42, "private", 42, command)
+                    self.assertIn(expected, session.messages[-1][1])
+        self.assertNotIn("Контейнеров", session.messages[0][1])
+        self.assertNotIn("bot:latest", session.messages[0][1])
+
+    async def test_reboot_requires_operator_private_chat_and_single_use_confirmation(self):
+        config = replace(CONFIG, reboot=RebootConfig(frozenset({42}), Path("/test"), 60))
+        dispatcher = dispatcher_for(config)
+        session = RecordingSession()
+        async with session:
+            bot = Bot(TEST_TOKEN, session=session)
+            with patch("dabro_monitor.reboot.Path.is_socket", return_value=True), patch(
+                "dabro_monitor.reboot.request_reboot", new_callable=AsyncMock, return_value=True,
+            ) as reboot:
+                await self.feed_message(dispatcher, bot, CONFIG.group_chat_id, "group", 42, "/reboot")
+                await self.feed_message(dispatcher, bot, 99, "private", 99, "/reboot")
+                self.assertEqual(session.messages, [])
+                await self.feed_message(dispatcher, bot, 42, "private", 42, "/reboot")
+                keyboard = session.requests[-1].reply_markup.inline_keyboard[0]
+                confirm, cancel = [button.callback_data for button in keyboard]
+                reboot.assert_not_awaited()
+                await self.feed_callback(dispatcher, bot, confirm, 1, user_id=99)
+                await self.feed_callback(dispatcher, bot, confirm, 2)
+                await self.feed_callback(dispatcher, bot, cancel, 1)
+                await self.feed_callback(dispatcher, bot, confirm, 1)
+                reboot.assert_not_awaited()
+                await self.feed_message(dispatcher, bot, 42, "private", 42, "/reboot")
+                confirm = session.requests[-1].reply_markup.inline_keyboard[0][0].callback_data
+                await self.feed_callback(dispatcher, bot, confirm, 2)
+                await self.feed_callback(dispatcher, bot, confirm, 2)
+                reboot.assert_awaited_once_with(Path("/test"))
+
+    async def test_reboot_rejects_expired_confirmation(self):
+        config = replace(CONFIG, reboot=RebootConfig(frozenset({42}), Path("/test"), 60))
+        dispatcher = dispatcher_for(config)
+        session = RecordingSession()
+        async with session:
+            bot = Bot(TEST_TOKEN, session=session)
+            with patch("dabro_monitor.reboot.Path.is_socket", return_value=True), patch(
+                "dabro_monitor.reboot.request_reboot", new_callable=AsyncMock,
+            ) as reboot, patch("dabro_monitor.reboot.time", wraps=time) as clock:
+                clock.monotonic.return_value = 100
+                await self.feed_message(dispatcher, bot, 42, "private", 42, "/reboot")
+                confirm = session.requests[-1].reply_markup.inline_keyboard[0][0].callback_data
+                clock.monotonic.return_value = 160
+                await self.feed_callback(dispatcher, bot, confirm, 1)
+                reboot.assert_not_awaited()
+
+    async def test_reboot_socket_requires_an_ack(self):
+        requests = []
+        responses = iter([b"OK\n", b""])
+
+        async def mock_listener(reader, writer):
+            requests.append(await reader.readline())
+            writer.write(next(responses))
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "control.sock"
+            server = await asyncio.start_unix_server(mock_listener, path)
+            async with server:
+                self.assertTrue(await request_reboot(path))
+                self.assertFalse(await request_reboot(path))
+        self.assertEqual(requests, [b"REBOOT\n", b"REBOOT\n"])
+
     async def test_commands_in_authorized_chats(self):
         dispatcher = dispatcher_for(CONFIG)
         session = RecordingSession()
