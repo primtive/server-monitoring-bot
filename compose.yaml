@@ -1,0 +1,56 @@
+x-app: &app
+  build: .
+  init: true
+  restart: unless-stopped
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
+services:
+  collector:
+    <<: *app
+    command: ["python", "-m", "dabro_monitor.collector"]
+    network_mode: host
+    environment:
+      SAMPLE_INTERVAL_SECONDS: &sample_interval "15"
+      LAN_INTERFACE: ""
+    volumes:
+      - /proc/stat:/host/proc/stat:ro
+      - /proc/meminfo:/host/proc/meminfo:ro
+      - /proc/uptime:/host/proc/uptime:ro
+      - /sys:/host/sys:ro
+      - snapshots:/run/dabro
+
+  bot:
+    <<: *app
+    command: ["python", "-m", "dabro_monitor.bot"]
+    depends_on:
+      - collector
+    environment:
+      BOT_TOKEN: ""
+      GROUP_CHAT_ID: ""
+      ALLOWED_USER_IDS: ""
+      TELEGRAM_PROXY_URL: "http://vpn-proxy:8080"
+      SAMPLE_INTERVAL_SECONDS: *sample_interval
+      TEMPERATURE_ALERT_C: "50"
+      TEMPERATURE_REARM_C: "47"
+      STARTUP_IP_WAIT_SECONDS: "60"
+    networks:
+      - vpn_proxy
+    volumes:
+      - snapshots:/run/dabro:ro
+
+networks:
+  vpn_proxy:
+    name: vpn-proxy
+    external: true
+
+volumes:
+  snapshots:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=1m,uid=10001,gid=10001,mode=0755"

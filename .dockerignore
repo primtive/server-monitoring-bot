@@ -1,0 +1,6 @@
+**
+!Dockerfile
+!requirements.txt
+!dabro_monitor/
+!dabro_monitor/*.py
+dabro_monitor/__pycache__/

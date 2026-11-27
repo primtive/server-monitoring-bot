@@ -1,0 +1,277 @@
+import asyncio
+import logging
+import sys
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.enums import ChatType
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramMigrateToChat,
+    TelegramNetworkError,
+    TelegramNotFound,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
+from aiogram.filters import Command
+from aiogram.methods import TelegramMethod
+from aiogram.types import BotCommand, Message
+from aiohttp_socks import ProxyConnectionError, ProxyError, ProxyTimeoutError
+
+from .config import MonitorConfig, TelegramConfig
+from .snapshot import Snapshot, read_snapshot
+
+LOGGER = logging.getLogger(__name__)
+GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+COMMANDS = [
+    BotCommand(command="status", description="Температура, CPU, RAM и аптайм"),
+    BotCommand(command="ip", description="LAN-адрес сервера"),
+    BotCommand(command="help", description="Список команд"),
+    BotCommand(command="start", description="Открыть мониторинг"),
+]
+HELP_TEXT = "Dabro · Мониторинг\n\n" + "\n".join(
+    f"/{command.command} — {command.description}" for command in COMMANDS[:3]
+)
+
+
+class TokenRedactingFormatter(logging.Formatter):
+    def __init__(self, token: str) -> None:
+        super().__init__("%(levelname)s %(name)s %(message)s")
+        self.token = token
+
+    def format(self, record: logging.LogRecord) -> str:
+        return super().format(record).replace(self.token, "[BOT_TOKEN]")
+
+
+class TelegramProxySession(AiohttpSession):
+    async def make_request[T](
+        self, bot: Bot, method: TelegramMethod[T], timeout: int | None = None,
+    ) -> T:
+        try:
+            return await super().make_request(bot, method, timeout)
+        except (ProxyConnectionError, ProxyError, ProxyTimeoutError):
+            raise TelegramNetworkError(method=method, message="HTTP proxy unavailable") from None
+
+
+def format_ip(snapshot: Snapshot | None) -> str:
+    address = snapshot.lan_ipv4 if snapshot else None
+    return f"LAN IPv4: {address or 'нет данных'}"
+
+
+def format_uptime(seconds: int | None) -> str:
+    if seconds is None:
+        return "нет данных"
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    parts = [f"{value} {unit}" for value, unit in (
+        (days, "д"), (hours, "ч"), (minutes, "мин"),
+    ) if value]
+    return " ".join(parts) or "меньше минуты"
+
+
+def format_status(snapshot: Snapshot | None) -> str:
+    if snapshot is None:
+        return "Dabro · Состояние\n\nНет свежих данных с сервера."
+
+    temperature = "нет данных"
+    if snapshot.temperature_c is not None:
+        temperature = f"{snapshot.temperature_c:g} °C"
+    cpu = "нет данных"
+    if snapshot.cpu_percent is not None:
+        cpu = f"{snapshot.cpu_percent:.0f}%"
+    ram = "нет данных"
+    if snapshot.memory_used_kib is not None and snapshot.memory_total_kib:
+        gib = 1024 ** 2
+        used = snapshot.memory_used_kib
+        total = snapshot.memory_total_kib
+        ram = f"{used / gib:.1f} / {total / gib:.1f} ГиБ ({used / total:.0%})"
+    return "\n".join((
+        "Dabro · Состояние", "",
+        f"Температура CPU: {temperature}",
+        f"Загрузка CPU: {cpu}",
+        f"RAM: {ram}",
+        f"Аптайм: {format_uptime(snapshot.uptime_seconds)}",
+    ))
+
+
+def is_allowed(message: Message, config: MonitorConfig) -> bool:
+    if message.chat.type in GROUP_TYPES:
+        return message.chat.id == config.group_chat_id
+    if message.chat.type == ChatType.PRIVATE and message.from_user:
+        return message.from_user.id in config.allowed_user_ids
+    return False
+
+
+def dispatcher_for(config: MonitorConfig) -> Dispatcher:
+    dispatcher = Dispatcher()
+    dispatcher.message.filter(lambda message: is_allowed(message, config))
+
+    @dispatcher.message(Command("start", "help"))
+    async def help_command(message: Message) -> None:
+        await message.answer(HELP_TEXT)
+
+    @dispatcher.message(Command("status"))
+    async def status_command(message: Message) -> None:
+        await message.answer(format_status(read_snapshot(config.interval * 3)))
+
+    @dispatcher.message(Command("ip"))
+    async def ip_command(message: Message) -> None:
+        await message.answer(format_ip(read_snapshot(config.interval * 3)))
+
+    return dispatcher
+
+
+async def retry_telegram[T](request: Callable[[], Awaitable[T]]) -> T:
+    delay = 1
+    while True:
+        try:
+            return await request()
+        except TelegramRetryAfter as error:
+            wait = max(1, error.retry_after)
+        except (TelegramNetworkError, TelegramServerError) as error:
+            LOGGER.warning("Запрос Telegram повторится (%s).", type(error).__name__)
+            wait = delay
+            delay = min(delay * 2, 30)
+        await asyncio.sleep(wait)
+
+
+async def notify_group(bot: Bot, group_chat_id: int, text: str) -> None:
+    try:
+        await retry_telegram(lambda: bot.send_message(group_chat_id, text))
+    except TelegramMigrateToChat as error:
+        LOGGER.error("Группа стала супергруппой. Обновите GROUP_CHAT_ID на %s.", error.migrate_to_chat_id)
+    except (TelegramBadRequest, TelegramForbiddenError, TelegramNotFound) as error:
+        LOGGER.error("Сообщение в группу не доставлено (%s). Проверьте ID и права бота.",
+                     type(error).__name__)
+
+
+async def announce_startup(bot: Bot, config: MonitorConfig) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + config.startup_wait
+    while True:
+        snapshot = read_snapshot(config.interval * 3)
+        time_left = deadline - loop.time()
+        if (snapshot and snapshot.lan_ipv4) or time_left <= 0:
+            break
+        await asyncio.sleep(min(1, time_left))
+    await notify_group(bot, config.group_chat_id, f"Dabro · Бот запущен\n\n{format_ip(snapshot)}")
+
+
+@dataclass
+class TemperatureAlarm:
+    alert_c: float
+    rearm_c: float
+    armed: bool = True
+
+    def update(self, temperature: float | None) -> bool:
+        if temperature is None:
+            return False
+        if temperature <= self.rearm_c:
+            self.armed = True
+        if self.armed and temperature >= self.alert_c:
+            self.armed = False
+            return True
+        return False
+
+
+async def watch_temperature(config: MonitorConfig, alerts: asyncio.Queue[float]) -> None:
+    alarm = TemperatureAlarm(config.alert_c, config.rearm_c)
+    while True:
+        snapshot = read_snapshot(config.interval * 3)
+        temperature = snapshot.temperature_c if snapshot else None
+        if alarm.update(temperature) and temperature is not None:
+            if alerts.full():
+                alerts.get_nowait()
+                alerts.task_done()
+            alerts.put_nowait(temperature)
+        await asyncio.sleep(min(1, config.interval))
+
+
+async def deliver_alerts(bot: Bot, config: MonitorConfig, alerts: asyncio.Queue[float]) -> None:
+    while True:
+        temperature = await alerts.get()
+        try:
+            await notify_group(
+                bot,
+                config.group_chat_id,
+                f"🌡 Dabro · Высокая температура CPU\n\n"
+                f"Температура: {temperature:g} °C\nПорог: {config.alert_c:g} °C",
+            )
+        finally:
+            alerts.task_done()
+
+
+async def run_bot(bot: Bot, config: MonitorConfig) -> None:
+    await retry_telegram(bot.me)
+    await retry_telegram(bot.delete_webhook)
+    await retry_telegram(lambda: bot.set_my_commands(COMMANDS))
+    dispatcher = dispatcher_for(config)
+    alerts: asyncio.Queue[float] = asyncio.Queue(maxsize=1)
+    async with asyncio.TaskGroup() as tasks:
+        background = (
+            tasks.create_task(announce_startup(bot, config)),
+            tasks.create_task(watch_temperature(config, alerts)),
+            tasks.create_task(deliver_alerts(bot, config, alerts)),
+        )
+        try:
+            await dispatcher.start_polling(bot, close_bot_session=False)
+        finally:
+            for task in background:
+                task.cancel()
+
+
+async def discover_ids(bot: Bot) -> None:
+    identity = await retry_telegram(bot.me)
+    username = identity.username or ""
+    await retry_telegram(bot.delete_webhook)
+    print(f"Отправьте /start в личке и /start@{username} в группе. Для выхода Ctrl+C.")
+    start_commands = {"/start", f"/start@{username.lower()}"}
+    offset = None
+    while True:
+        updates = await retry_telegram(
+            lambda: bot.get_updates(offset=offset, timeout=10, allowed_updates=["message"]),
+        )
+        for update in updates:
+            offset = update.update_id + 1
+            message = update.message
+            if not message or not message.text or not message.text.strip():
+                continue
+            if message.text.split()[0].lower() not in start_commands:
+                continue
+            if message.chat.type in GROUP_TYPES:
+                print(f"GROUP_CHAT_ID: {message.chat.id}")
+            elif message.chat.type == ChatType.PRIVATE and message.from_user:
+                print(f"ALLOWED_USER_IDS: {message.from_user.id}")
+
+
+async def main(discover: bool) -> None:
+    telegram = TelegramConfig.from_env()
+    config = None if discover else MonitorConfig.from_env()
+    handler = logging.StreamHandler()
+    handler.setFormatter(TokenRedactingFormatter(telegram.token))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    async with TelegramProxySession(proxy=telegram.proxy_url, timeout=15) as session:
+        bot = Bot(token=telegram.token, session=session)
+        try:
+            if config is None:
+                await discover_ids(bot)
+            else:
+                await run_bot(bot, config)
+        except TelegramAPIError as error:
+            raise SystemExit(f"Запуск Telegram остановлен ({type(error).__name__}).") from None
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] not in ([], ["discover-ids"]):
+        raise SystemExit("Использование: python -m dabro_monitor.bot [discover-ids]")
+    try:
+        asyncio.run(main(sys.argv[1:] == ["discover-ids"]))
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
+    except KeyboardInterrupt:
+        pass

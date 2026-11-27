@@ -1,0 +1,6 @@
+services:
+  bot:
+    environment:
+      BOT_TOKEN: ""
+      GROUP_CHAT_ID: ""
+      ALLOWED_USER_IDS: ""

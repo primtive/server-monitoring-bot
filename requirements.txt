@@ -1,0 +1,1 @@
+aiogram[proxy]==3.34.0
